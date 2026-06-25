@@ -1,12 +1,14 @@
 <?php
 
-namespace VendorName\Skeleton\Commands;
+declare(strict_types=1);
+
+namespace Ziming\LaravelCloudflareWorkersKv\Commands;
 
 use Illuminate\Console\Command;
 
-class SkeletonCommand extends Command
+final class LaravelCloudflareWorkersKvCommand extends Command
 {
-    public $signature = 'skeleton';
+    public $signature = 'laravel-cloudflare-workers-kv';
 
     public $description = 'My command';
 
