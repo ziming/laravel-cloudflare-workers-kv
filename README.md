@@ -5,15 +5,7 @@
 [![GitHub Code Style Action Status](https://github.com/spatie/package-laravel-cloudflare-workers-kv-laravel/actions/workflows/fix-php-code-style-issues.yml/badge.svg)](https://github.com/ziming/laravel-cloudflare-workers-kv/actions?query=workflow%3A"Fix+PHP+code+style+issues"+branch%3Amain)
 [![Total Downloads](https://img.shields.io/packagist/dt/ziming/laravel-cloudflare-workers-kv.svg?style=flat-square)](https://packagist.org/packages/ziming/laravel-cloudflare-workers-kv)
 
-This is where your description should go. Limit it to a paragraph or two. Consider adding a small example.
-
-## Support us
-
-[<img src="https://github-ads.s3.eu-central-1.amazonaws.com/laravel-cloudflare-workers-kv.jpg?t=1" width="419px" />](https://spatie.be/github-ad-click/laravel-cloudflare-workers-kv)
-
-We invest a lot of resources into creating [best in class open source packages](https://spatie.be/open-source). You can support us by [buying one of our paid products](https://spatie.be/open-source/support-us).
-
-We highly appreciate you sending us a postcard from your hometown, mentioning which of our package(s) you are using. You'll find our address on [our contact page](https://spatie.be/about-us). We publish all received postcards on [our virtual postcard wall](https://spatie.be/open-source/postcards).
+Use Cloudflare Workers KV as a Laravel cache store or as a small key/value client. Values can be stored with Laravel-compatible PHP serialization or as plain JSON for easy reads from other Cloudflare Workers.
 
 ## Installation
 
@@ -21,13 +13,6 @@ You can install the package via composer:
 
 ```bash
 composer require ziming/laravel-cloudflare-workers-kv
-```
-
-You can publish and run the migrations with:
-
-```bash
-php artisan vendor:publish --tag="laravel-cloudflare-workers-kv-migrations"
-php artisan migrate
 ```
 
 You can publish the config file with:
@@ -40,20 +25,102 @@ This is the contents of the published config file:
 
 ```php
 return [
+    'account_id' => $_ENV['CLOUDFLARE_KV_ACCOUNT_ID'] ?? $_SERVER['CLOUDFLARE_KV_ACCOUNT_ID'] ?? null,
+
+    'namespace_id' => $_ENV['CLOUDFLARE_KV_NAMESPACE_ID'] ?? $_SERVER['CLOUDFLARE_KV_NAMESPACE_ID'] ?? null,
+
+    'api_token' => $_ENV['CLOUDFLARE_KV_API_TOKEN'] ?? $_SERVER['CLOUDFLARE_KV_API_TOKEN'] ?? null,
+
+    'base_url' => $_ENV['CLOUDFLARE_KV_BASE_URL'] ?? $_SERVER['CLOUDFLARE_KV_BASE_URL'] ?? 'https://api.cloudflare.com/client/v4',
+
+    'serializer' => $_ENV['CLOUDFLARE_KV_SERIALIZER'] ?? $_SERVER['CLOUDFLARE_KV_SERIALIZER'] ?? 'php',
+
+    'prefix' => $_ENV['CLOUDFLARE_KV_PREFIX'] ?? $_SERVER['CLOUDFLARE_KV_PREFIX'] ?? '',
 ];
 ```
 
-Optionally, you can publish the views using
+Add your Cloudflare credentials to `.env`:
 
-```bash
-php artisan vendor:publish --tag="laravel-cloudflare-workers-kv-views"
+```dotenv
+CLOUDFLARE_KV_ACCOUNT_ID=your-account-id
+CLOUDFLARE_KV_NAMESPACE_ID=your-namespace-id
+CLOUDFLARE_KV_API_TOKEN=your-api-token
 ```
 
 ## Usage
 
+### Laravel cache store
+
+Add a cache store to `config/cache.php`:
+
 ```php
-$laravelCloudflareWorkersKv = new Ziming\LaravelCloudflareWorkersKv();
+'stores' => [
+    'cloudflare' => [
+        'driver' => 'cloudflare-kv',
+        'serializer' => 'php',
+        'prefix' => env('CACHE_PREFIX', Str::slug(env('APP_NAME', 'laravel'), '_').'_cache_'),
+    ],
+],
 ```
+
+Then use it like any other Laravel cache store:
+
+```php
+Cache::store('cloudflare')->put('user:1', ['name' => 'Ada'], 3600);
+
+$user = Cache::store('cloudflare')->get('user:1');
+```
+
+The default `php` serializer uses PHP `serialize()` and `unserialize()`, matching the behavior expected by Laravel applications storing arrays, objects, booleans, and numbers in cache.
+
+### JSON key/value pairs
+
+Use the `json` serializer when other Cloudflare Workers should read the values directly:
+
+```php
+'stores' => [
+    'cloudflare-json' => [
+        'driver' => 'cloudflare-kv',
+        'serializer' => 'json',
+        'prefix' => 'shared:',
+    ],
+],
+```
+
+```php
+Cache::store('cloudflare-json')->forever('feature-flags', [
+    'checkout' => true,
+    'limit' => 5,
+]);
+```
+
+That stores this raw KV value:
+
+```json
+{"checkout":true,"limit":5}
+```
+
+From a Worker, read it as ordinary JSON:
+
+```ts
+const flags = await env.KV.get("shared:feature-flags", "json");
+```
+
+### Direct client
+
+You can also resolve the package client directly:
+
+```php
+use Ziming\LaravelCloudflareWorkersKv\LaravelCloudflareWorkersKv;
+
+$kv = app(LaravelCloudflareWorkersKv::class);
+
+$kv->put('settings', ['theme' => 'dark']);
+
+$settings = $kv->get('settings');
+```
+
+Cloudflare Workers KV requires `expiration_ttl` values to be at least 60 seconds. This package sends cache TTLs to Cloudflare using that API constraint.
 
 ## Testing
 

@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Factories\Factory;
 use Orchestra\Testbench\TestCase as Orchestra;
 use Ziming\LaravelCloudflareWorkersKv\LaravelCloudflareWorkersKvServiceProvider;
 
-final class TestCase extends Orchestra
+abstract class TestCase extends Orchestra
 {
     protected function setUp(): void
     {
@@ -19,7 +19,7 @@ final class TestCase extends Orchestra
         );
     }
 
-    public function getEnvironmentSetUp($app): void
+    final public function getEnvironmentSetUp($app): void
     {
         config()->set('database.default', 'testing');
 
