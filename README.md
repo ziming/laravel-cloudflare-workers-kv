@@ -1,8 +1,8 @@
 # Laravel package for Cloudflare Workers KV
 
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/ziming/laravel-cloudflare-workers-kv.svg?style=flat-square)](https://packagist.org/packages/ziming/laravel-cloudflare-workers-kv)
-[![GitHub Tests Action Status](https://github.com/spatie/package-laravel-cloudflare-workers-kv-laravel/actions/workflows/run-tests.yml/badge.svg)](https://github.com/ziming/laravel-cloudflare-workers-kv/actions?query=workflow%3Arun-tests+branch%3Amain)
-[![GitHub Code Style Action Status](https://github.com/spatie/package-laravel-cloudflare-workers-kv-laravel/actions/workflows/fix-php-code-style-issues.yml/badge.svg)](https://github.com/ziming/laravel-cloudflare-workers-kv/actions?query=workflow%3A"Fix+PHP+code+style+issues"+branch%3Amain)
+[![GitHub Tests Action Status](https://github.com/ziming/laravel-cloudflare-workers-kv/actions/workflows/run-tests.yml/badge.svg)](https://github.com/ziming/laravel-cloudflare-workers-kv/actions?query=workflow%3Arun-tests+branch%3Amain)
+[![GitHub Code Style Action Status](https://github.com/ziming/laravel-cloudflare-workers-kv/actions/workflows/fix-php-code-style-issues.yml/badge.svg)](https://github.com/ziming/laravel-cloudflare-workers-kv/actions?query=workflow%3A"Fix+PHP+code+style+issues"+branch%3Amain)
 [![Total Downloads](https://img.shields.io/packagist/dt/ziming/laravel-cloudflare-workers-kv.svg?style=flat-square)](https://packagist.org/packages/ziming/laravel-cloudflare-workers-kv)
 
 Use Cloudflare Workers KV as a Laravel cache store or as a small key/value client. Values can be stored with Laravel-compatible PHP serialization or as plain JSON for easy reads from other Cloudflare Workers.
@@ -34,6 +34,11 @@ return [
     'base_url' => env('CLOUDFLARE_KV_BASE_URL', 'https://api.cloudflare.com/client/v4'),
 
     'serializer' => env('CLOUDFLARE_KV_SERIALIZER', 'php'),
+
+    // Restricts which classes may be instantiated when unserializing PHP-serialized
+    // values. Use an array of class-strings to allowlist, false to forbid all objects,
+    // or null (default) to allow all. See "Security" below.
+    'allowed_classes' => null,
 
     'prefix' => env('CLOUDFLARE_KV_PREFIX', ''),
 ];
@@ -120,7 +125,61 @@ $kv->put('settings', ['theme' => 'dark']);
 $settings = $kv->get('settings');
 ```
 
-Cloudflare Workers KV requires `expiration_ttl` values to be at least 60 seconds. This package sends cache TTLs to Cloudflare using that API constraint.
+The client also exposes bulk helpers, which use Cloudflare's bulk REST endpoints
+(one request per batch instead of one request per key):
+
+```php
+$kv->putMany(['a' => 1, 'b' => 2], 3600);   // PUT .../bulk  (up to 10,000 keys/request)
+
+$values = $kv->many(['a', 'b', 'c']);        // POST .../bulk/get (up to 100 keys/request)
+// => ['a' => 1, 'b' => 2, 'c' => null]      // missing keys are null
+
+$kv->deleteMany(['a', 'b']);                  // POST .../bulk/delete (up to 10,000 keys/request)
+```
+
+The same bulk endpoints back `Cache::many()`, `Cache::putMany()`, and `Cache::flush()`
+on the cache store, so flushing or warming many keys does not fan out into N HTTP calls.
+
+## Caveats & consistency model
+
+Cloudflare Workers KV is an **eventually consistent, globally distributed** store. Its
+characteristics differ from Redis/Memcached, so keep the following in mind before choosing
+it as your cache backend:
+
+- **Reads can be stale.** After a write, other edge locations may serve the previous value
+  for a short period while the change propagates globally. KV is optimized for read-heavy
+  workloads, not read-after-write consistency.
+- **No atomic operations.** `increment()` / `decrement()` are implemented as a non-atomic
+  read-modify-write. Concurrent writers can lose updates. The remaining TTL is preserved by
+  reading expiry metadata written on the previous `put()`, but the counter value itself is
+  best-effort. **Do not use this store for rate limiting** (`RateLimiter`) where exact counts
+  matter under concurrency.
+- **No cache locks.** The store does not implement `LockProvider`, so `Cache::lock()` is not
+  available — KV cannot provide the atomic guarantees a lock requires. Use the `database` or
+  `redis` store for locks.
+- **60-second minimum TTL.** Cloudflare enforces a 60-second floor on `expiration_ttl`. TTLs
+  below 60 seconds are silently raised to 60, so sub-minute expirations behave as one minute.
+- **Key constraints.** Keys (including the configured `prefix`) must be non-empty, at most
+  512 bytes, and contain no whitespace. Invalid keys throw an `InvalidArgumentException`.
+
+In short: KV is a great fit for read-heavy, geographically distributed caching, and a poor
+fit for locks, atomic counters, and anything needing strong consistency.
+
+## Security
+
+When using the `php` serializer, cached values are restored with PHP's `unserialize()`. If the
+KV namespace is shared with, or writable by, untrusted parties, a malicious payload could trigger
+PHP object injection. Restrict which classes may be instantiated via the `allowed_classes` config
+option:
+
+```php
+// config/cloudflare-workers-kv.php
+'allowed_classes' => false,                          // forbid all objects (scalars/arrays only)
+// or
+'allowed_classes' => [App\Dto\FeatureFlags::class],  // allowlist specific classes
+```
+
+The `json` serializer does not call `unserialize()` and is not affected.
 
 ## Testing
 

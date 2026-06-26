@@ -36,14 +36,12 @@
     },
     "autoload": {
         "psr-4": {
-            "Ziming\\LaravelCloudflareWorkersKv\\": "src/",
-            "Ziming\\LaravelCloudflareWorkersKv\\Database\\Factories\\": "database/factories/"
+            "Ziming\\LaravelCloudflareWorkersKv\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Ziming\\LaravelCloudflareWorkersKv\\Tests\\": "tests/",
-            "Workbench\\App\\": "workbench/app/"
+            "Ziming\\LaravelCloudflareWorkersKv\\Tests\\": "tests/"
         }
     },
     "scripts": {
