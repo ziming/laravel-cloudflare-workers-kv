@@ -104,7 +104,7 @@ final class CloudflareKvStore implements Store
         $ttl = (int) $seconds;
         $expiresAt = time() + $ttl;
         $serializer = $this->serializer;
-        $useBase64 = $serializer instanceof \Ziming\LaravelCloudflareWorkersKv\Serialization\PhpSerializer;
+        $useBase64 = $serializer instanceof Serialization\PhpSerializer;
 
         $entries = [];
         foreach ($values as $key => $value) {
@@ -221,7 +221,7 @@ final class CloudflareKvStore implements Store
             throw new InvalidArgumentException('Cache key must not be empty.');
         }
 
-        if (strlen($this->prefix.$key) > 512) {
+        if (mb_strlen($this->prefix.$key) > 512) {
             throw new InvalidArgumentException(
                 sprintf('Cache key "%s" with prefix exceeds the 512-byte Cloudflare KV limit.', $key),
             );
