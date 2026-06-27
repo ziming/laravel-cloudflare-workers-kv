@@ -4,69 +4,86 @@ declare(strict_types=1);
 
 namespace Ziming\LaravelCloudflareWorkersKv;
 
-use GuzzleHttp\Client;
 use Illuminate\Cache\Repository;
 use Illuminate\Contracts\Foundation\Application;
-use InvalidArgumentException;
 use Spatie\LaravelPackageTools\Package;
 use Spatie\LaravelPackageTools\PackageServiceProvider;
+use Ziming\LaravelCloudflareWorkersKv\Commands\GetCommand;
+use Ziming\LaravelCloudflareWorkersKv\Commands\KeysCommand;
+use Ziming\LaravelCloudflareWorkersKv\Commands\VerifyCommand;
 use Ziming\LaravelCloudflareWorkersKv\Serialization\SerializerFactory;
 
 final class LaravelCloudflareWorkersKvServiceProvider extends PackageServiceProvider
 {
+    /**
+     * Config keys that select which Cloudflare namespace/connection a client targets.
+     * When a cache store overrides any of these it gets its own client instance.
+     */
+    private const array CLIENT_KEYS = [
+        'account_id',
+        'namespace_id',
+        'api_token',
+        'base_url',
+        'timeout',
+        'connect_timeout',
+    ];
+
     public function configurePackage(Package $package): void
     {
         $package
             ->name('laravel-cloudflare-workers-kv')
-            ->hasConfigFile();
+            ->hasConfigFile()
+            ->hasCommands([
+                VerifyCommand::class,
+                KeysCommand::class,
+                GetCommand::class,
+            ]);
     }
 
     public function packageRegistered(): void
     {
         $this->app->singleton(CloudflareKvClient::class, function (Application $app): CloudflareKvClient {
-            $config = $app['config']->get('cloudflare-workers-kv');
-
-            $this->requireConfig($config, ['account_id', 'namespace_id', 'api_token']);
-
-            return new RestCloudflareKvClient(
-                new Client([
-                    'base_uri' => mb_rtrim((string) $config['base_url'], '/').'/',
-                    'headers' => [
-                        'Authorization' => 'Bearer '.$config['api_token'],
-                    ],
-                    'http_errors' => true,
-                ]),
-                (string) $config['account_id'],
-                (string) $config['namespace_id'],
-            );
+            return CloudflareKvClientFactory::make(self::globalConfig($app));
         });
 
         $this->app->singleton(LaravelCloudflareWorkersKv::class, function (Application $app): LaravelCloudflareWorkersKv {
-            $config = $app['config']->get('cloudflare-workers-kv');
+            $config = self::globalConfig($app);
 
             return new LaravelCloudflareWorkersKv(
                 $app->make(CloudflareKvClient::class),
                 SerializerFactory::make(
-                    (string) $config['serializer'],
+                    (string) ($config['serializer'] ?? 'php'),
                     $config['allowed_classes'] ?? null,
                 ),
-                (string) $config['prefix'],
+                (string) ($config['prefix'] ?? ''),
             );
         });
     }
 
     public function packageBooted(): void
     {
-        $this->app['cache']->extend('cloudflare-kv', function (Application $app, array $config): Repository {
-            $globalConfig = $app['config']->get('cloudflare-workers-kv');
+        // The cache manager invokes this closure with its own scope, so it must
+        // not reference $this/self — everything it needs is passed in or static.
+        $clientKeys = self::CLIENT_KEYS;
+
+        $this->app['cache']->extend('cloudflare-kv', function (Application $app, array $config) use ($clientKeys): Repository {
+            $global = $app['config']->get('cloudflare-workers-kv');
+            $merged = array_merge(is_array($global) ? $global : [], $config);
+
+            // Only build a dedicated client when the store overrides connection
+            // credentials; otherwise reuse the shared singleton (back-compatible).
+            $client = array_intersect_key($config, array_flip($clientKeys)) !== []
+                ? CloudflareKvClientFactory::make($merged)
+                : $app->make(CloudflareKvClient::class);
 
             $store = new CloudflareKvStore(
-                $app->make(CloudflareKvClient::class),
+                $client,
                 SerializerFactory::make(
-                    (string) ($config['serializer'] ?? $globalConfig['serializer'] ?? 'php'),
-                    $config['allowed_classes'] ?? $globalConfig['allowed_classes'] ?? null,
+                    (string) ($merged['serializer'] ?? 'php'),
+                    $merged['allowed_classes'] ?? null,
                 ),
-                (string) ($config['prefix'] ?? $globalConfig['prefix'] ?? ''),
+                (string) ($merged['prefix'] ?? ''),
+                (bool) ($merged['graceful'] ?? false),
             );
 
             return new Repository($store, $config);
@@ -74,17 +91,12 @@ final class LaravelCloudflareWorkersKvServiceProvider extends PackageServiceProv
     }
 
     /**
-     * @param  array<string, mixed>  $config
-     * @param  list<string>  $keys
+     * @return array<string, mixed>
      */
-    private function requireConfig(array $config, array $keys): void
+    private static function globalConfig(Application $app): array
     {
-        foreach ($keys as $key) {
-            if (empty($config[$key])) {
-                throw new InvalidArgumentException(
-                    "Cloudflare KV configuration key [{$key}] is missing or empty. Check your cloudflare-workers-kv config.",
-                );
-            }
-        }
+        $config = $app['config']->get('cloudflare-workers-kv');
+
+        return is_array($config) ? $config : [];
     }
 }

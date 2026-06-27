@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Cache;
 use Ziming\LaravelCloudflareWorkersKv\CloudflareKvClient;
+use Ziming\LaravelCloudflareWorkersKv\CloudflareKvException;
 use Ziming\LaravelCloudflareWorkersKv\LaravelCloudflareWorkersKv;
+use Ziming\LaravelCloudflareWorkersKv\RestCloudflareKvClient;
 use Ziming\LaravelCloudflareWorkersKv\Tests\Fakes\InMemoryCloudflareKvClient;
+use Ziming\LaravelCloudflareWorkersKv\Tests\Fakes\ThrowingCloudflareKvClient;
 
 beforeEach(function (): void {
     $this->client = new InMemoryCloudflareKvClient();
@@ -32,17 +35,17 @@ it('stores Laravel cache values with PHP serialization by default', function ():
 
     expect($this->client->values['app:user:1'])->toBe(serialize(['name' => 'Ada']))
         ->and(Cache::store('cloudflare')->get('user:1'))->toBe(['name' => 'Ada'])
-        ->and($this->client->expirations['app:user:1'])->toBe(120);
+        ->and($this->client->ttls['app:user:1'])->toBe(120);
 });
 
-it('stores the expiry timestamp in metadata on put', function (): void {
+it('resolves an absolute expiry from the TTL on put', function (): void {
     $before = time();
     Cache::store('cloudflare')->put('key', 'val', 300);
     $after = time();
 
-    $meta = $this->client->metadata['app:key'];
-    expect($meta['e'])->toBeGreaterThanOrEqual($before + 300)
-        ->and($meta['e'])->toBeLessThanOrEqual($after + 300);
+    $expiry = $this->client->expirations['app:key'];
+    expect($expiry)->toBeGreaterThanOrEqual($before + 300)
+        ->and($expiry)->toBeLessThanOrEqual($after + 300);
 });
 
 it('can store JSON values for Worker interoperability', function (): void {
@@ -71,6 +74,50 @@ it('deletes a key when put is called with zero or negative seconds', function ()
 });
 
 // ──────────────────────────────────────────────
+// Deserialize failures degrade to a miss
+// ──────────────────────────────────────────────
+
+it('treats a value that fails to deserialize as a cache miss', function (): void {
+    $this->client->values['shared:corrupt'] = '{not valid json';
+
+    expect(Cache::store('cloudflare-json')->get('corrupt'))->toBeNull();
+});
+
+it('treats a corrupt value within many() as a miss', function (): void {
+    Cache::store('cloudflare-json')->put('good', ['ok' => true], 60);
+    $this->client->values['shared:corrupt'] = '{not valid json';
+
+    expect(Cache::store('cloudflare-json')->many(['good', 'corrupt']))->toBe([
+        'good' => ['ok' => true],
+        'corrupt' => null,
+    ]);
+});
+
+// ──────────────────────────────────────────────
+// Graceful reads (config-gated fail-open)
+// ──────────────────────────────────────────────
+
+it('degrades reads to a miss when graceful is enabled', function (): void {
+    app()->instance(CloudflareKvClient::class, new ThrowingCloudflareKvClient());
+
+    config()->set('cache.stores.kv-graceful', [
+        'driver' => 'cloudflare-kv',
+        'graceful' => true,
+    ]);
+
+    expect(Cache::store('kv-graceful')->get('x'))->toBeNull()
+        ->and(Cache::store('kv-graceful')->many(['x', 'y']))->toBe(['x' => null, 'y' => null]);
+});
+
+it('rethrows read failures by default', function (): void {
+    app()->instance(CloudflareKvClient::class, new ThrowingCloudflareKvClient());
+
+    config()->set('cache.stores.kv-loud', ['driver' => 'cloudflare-kv']);
+
+    expect(fn () => Cache::store('kv-loud')->get('x'))->toThrow(CloudflareKvException::class);
+});
+
+// ──────────────────────────────────────────────
 // many / putMany
 // ──────────────────────────────────────────────
 
@@ -87,11 +134,12 @@ it('stores many values in one bulk call with a shared TTL', function (): void {
     Cache::store('cloudflare')->putMany(['x' => 10, 'y' => 20], 120);
 
     expect(Cache::store('cloudflare')->get('x'))->toBe(10)
-        ->and(Cache::store('cloudflare')->get('y'))->toBe(20);
+        ->and(Cache::store('cloudflare')->get('y'))->toBe(20)
+        ->and($this->client->ttls['app:x'])->toBe(120);
 });
 
 // ──────────────────────────────────────────────
-// increment / decrement — TTL preservation
+// increment / decrement — native absolute expiry
 // ──────────────────────────────────────────────
 
 it('increments a numeric cache value', function (): void {
@@ -103,13 +151,15 @@ it('increments a numeric cache value', function (): void {
         ->and(Cache::store('cloudflare')->get('counter'))->toBe(6);
 });
 
-it('preserves the remaining TTL when incrementing', function (): void {
+it('preserves the exact absolute expiry across increments (no creep)', function (): void {
     Cache::store('cloudflare')->put('counter', 0, 300);
+    $expiry = $this->client->expirations['app:counter'];
 
     Cache::store('cloudflare')->increment('counter');
+    Cache::store('cloudflare')->increment('counter');
 
-    // The re-written value should still carry an expiration (not null = forever)
-    expect($this->client->expirations['app:counter'])->not->toBeNull();
+    expect(Cache::store('cloudflare')->get('counter'))->toBe(2)
+        ->and($this->client->expirations['app:counter'])->toBe($expiry);
 });
 
 it('decrements a numeric cache value', function (): void {
@@ -128,6 +178,13 @@ it('returns false when incrementing a non-numeric value', function (): void {
 
 it('returns false when incrementing a missing key', function (): void {
     expect(Cache::store('cloudflare')->increment('missing'))->toBeFalse();
+});
+
+it('returns false when incrementing an already-expired key', function (): void {
+    $this->client->values['app:counter'] = serialize(5);
+    $this->client->expirations['app:counter'] = time() - 10;
+
+    expect(Cache::store('cloudflare')->increment('counter'))->toBeFalse();
 });
 
 it('increments by a custom step', function (): void {
@@ -173,16 +230,46 @@ it('flushes only keys with the configured prefix', function (): void {
 
 it('touch refreshes the TTL of an existing key', function (): void {
     $this->client->put('app:key', serialize('hello'), 60);
-    $this->client->metadata['app:key'] = ['e' => time() + 60];
 
     $result = Cache::store('cloudflare')->touch('key', 300);
 
     expect($result)->toBeTrue()
-        ->and($this->client->expirations['app:key'])->toBe(300);
+        ->and($this->client->ttls['app:key'])->toBe(300);
 });
 
 it('touch returns false for a missing key', function (): void {
     expect(Cache::store('cloudflare')->touch('missing', 60))->toBeFalse();
+});
+
+// ──────────────────────────────────────────────
+// Per-store credentials (multi-namespace)
+// ──────────────────────────────────────────────
+
+it('routes per-store credential overrides to distinct namespaces', function (): void {
+    config()->set('cloudflare-workers-kv.account_id', 'acct');
+    config()->set('cloudflare-workers-kv.api_token', 'token');
+
+    config()->set('cache.stores.kv-a', [
+        'driver' => 'cloudflare-kv',
+        'namespace_id' => 'namespace-a',
+    ]);
+    config()->set('cache.stores.kv-b', [
+        'driver' => 'cloudflare-kv',
+        'namespace_id' => 'namespace-b',
+    ]);
+
+    $clientA = Cache::store('kv-a')->getStore()->client();
+    $clientB = Cache::store('kv-b')->getStore()->client();
+
+    expect($clientA)->toBeInstanceOf(RestCloudflareKvClient::class)
+        ->and($clientB)->toBeInstanceOf(RestCloudflareKvClient::class)
+        ->and($clientA->namespaceId())->toBe('namespace-a')
+        ->and($clientB->namespaceId())->toBe('namespace-b')
+        ->and($clientA->accountId())->toBe('acct');
+});
+
+it('reuses the shared client when a store does not override credentials', function (): void {
+    expect(Cache::store('cloudflare')->getStore()->client())->toBe($this->client);
 });
 
 // ──────────────────────────────────────────────
@@ -213,6 +300,30 @@ it('supports direct JSON and serialized access helpers', function (): void {
         ->and($this->client->values['laravel-key'])->toBe(serialize(['value' => 20]))
         ->and(LaravelCloudflareWorkersKv::json($this->client)->get('worker-key'))->toBe(['value' => 10])
         ->and(LaravelCloudflareWorkersKv::serialized($this->client)->get('laravel-key'))->toBe(['value' => 20]);
+});
+
+it('stores values forever through the direct client', function (): void {
+    $kv = LaravelCloudflareWorkersKv::json($this->client);
+
+    $kv->forever('flag', true);
+
+    expect($this->client->values['flag'])->toBe('true')
+        ->and($this->client->expirations['flag'])->toBeNull();
+});
+
+it('exposes value, expiration and metadata through the direct client', function (): void {
+    $kv = LaravelCloudflareWorkersKv::serialized($this->client, 'p:');
+    $kv->put('answer', 42, 300);
+    $expiry = $this->client->expirations['p:answer'];
+
+    expect($kv->getWithMetadata('answer'))->toBe([
+        'value' => 42,
+        'expiration' => $expiry,
+        'metadata' => [],
+    ])
+        ->and($kv->expiresAt('answer'))->toBe($expiry)
+        ->and($kv->getWithMetadata('missing'))->toBeNull()
+        ->and($kv->expiresAt('missing'))->toBeNull();
 });
 
 it('supports bulk helpers on the direct client', function (): void {

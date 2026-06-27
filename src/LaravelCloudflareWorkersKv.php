@@ -63,9 +63,44 @@ final readonly class LaravelCloudflareWorkersKv
         return $results;
     }
 
+    /**
+     * Read a value together with its absolute expiration (unix timestamp, or
+     * null when the key never expires) and metadata. Returns null if absent.
+     *
+     * @return array{value: mixed, expiration: int|null, metadata: array<string, mixed>}|null
+     */
+    public function getWithMetadata(string $key): ?array
+    {
+        $entry = $this->client->getWithMetadata($this->prefix.$key);
+
+        if ($entry === null) {
+            return null;
+        }
+
+        return [
+            'value' => $this->serializer->unserialize($entry['value']),
+            'expiration' => $entry['expiration'],
+            'metadata' => $entry['metadata'],
+        ];
+    }
+
+    /**
+     * The absolute expiry (unix timestamp) of a key, or null when it never
+     * expires or does not exist.
+     */
+    public function expiresAt(string $key): ?int
+    {
+        return $this->client->getWithMetadata($this->prefix.$key)['expiration'] ?? null;
+    }
+
     public function put(string $key, mixed $value, ?int $seconds = null): bool
     {
         return $this->client->put($this->prefix.$key, $this->serializer->serialize($value), $seconds);
+    }
+
+    public function forever(string $key, mixed $value): bool
+    {
+        return $this->client->put($this->prefix.$key, $this->serializer->serialize($value));
     }
 
     /**

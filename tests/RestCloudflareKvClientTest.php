@@ -27,23 +27,31 @@ function makeClient(array $responses, array &$history = []): RestCloudflareKvCli
 }
 
 // ──────────────────────────────────────────────
-// Single-value PUT (multipart with metadata)
+// Identity accessors
+// ──────────────────────────────────────────────
+
+it('exposes the configured account and namespace', function (): void {
+    $client = makeClient([]);
+
+    expect($client->accountId())->toBe('account-id')
+        ->and($client->namespaceId())->toBe('namespace-id');
+});
+
+// ──────────────────────────────────────────────
+// Single-value PUT (multipart)
 // ──────────────────────────────────────────────
 
 it('writes a value to the Cloudflare values endpoint as multipart/form-data', function (): void {
     $history = [];
     $client = makeClient([new Response(200, [], '{"success":true}')], $history);
 
-    $client->put('feature:checkout', '{"enabled":true}', 300, ['e' => 9999]);
+    $client->put('feature:checkout', '{"enabled":true}', 300);
 
     $request = $history[0]['request'];
     expect($request->getMethod())->toBe('PUT')
         ->and((string) $request->getUri())->toContain('/values/feature%3Acheckout?expiration_ttl=300')
-        ->and($request->getHeaderLine('Content-Type'))->toContain('multipart/form-data');
-
-    $body = (string) $request->getBody();
-    expect($body)->toContain('{"enabled":true}')
-        ->and($body)->toContain('"e":9999');
+        ->and($request->getHeaderLine('Content-Type'))->toContain('multipart/form-data')
+        ->and((string) $request->getBody())->toContain('{"enabled":true}');
 });
 
 it('clamps expiration_ttl to the 60-second minimum', function (): void {
@@ -53,6 +61,37 @@ it('clamps expiration_ttl to the 60-second minimum', function (): void {
     $client->put('key', 'value', 30);
 
     expect((string) $history[0]['request']->getUri())->toContain('expiration_ttl=60');
+});
+
+it('writes an absolute expiration when one is provided', function (): void {
+    $history = [];
+    $client = makeClient([new Response(200, [], '{"success":true}')], $history);
+
+    $expiration = time() + 3600;
+    $client->put('key', 'value', null, $expiration);
+
+    $uri = (string) $history[0]['request']->getUri();
+    expect($uri)->toContain('expiration='.$expiration)
+        ->and($uri)->not->toContain('expiration_ttl');
+});
+
+it('clamps an absolute expiration to the 60-second floor', function (): void {
+    $history = [];
+    $client = makeClient([new Response(200, [], '{"success":true}')], $history);
+
+    $client->put('key', 'value', null, time() + 5);
+
+    preg_match('/expiration=(\d+)/', (string) $history[0]['request']->getUri(), $matches);
+    expect((int) $matches[1])->toBeGreaterThanOrEqual(time() + 59);
+});
+
+it('writes a value with no expiry when ttl and expiration are null', function (): void {
+    $history = [];
+    $client = makeClient([new Response(200, [], '{"success":true}')], $history);
+
+    $client->put('key', 'value');
+
+    expect((string) $history[0]['request']->getUri())->not->toContain('expiration');
 });
 
 it('returns null for a missing key on get', function (): void {
@@ -71,7 +110,7 @@ it('wraps non-404 client errors in CloudflareKvException on get', function (): v
 // Bulk GET
 // ──────────────────────────────────────────────
 
-it('retrieves multiple values via the bulk get endpoint in chunks of 100', function (): void {
+it('retrieves multiple values via the bulk get endpoint as text', function (): void {
     $history = [];
     $client = makeClient([
         new Response(200, [], json_encode([
@@ -89,7 +128,63 @@ it('retrieves multiple values via the bulk get endpoint in chunks of 100', funct
     $body = json_decode((string) $history[0]['request']->getBody(), true);
     expect($body['keys'])->toContain('app:one')
         ->and($body['keys'])->toContain('app:two')
-        ->and($body['keys'])->toContain('app:missing');
+        ->and($body['keys'])->toContain('app:missing')
+        ->and($body['type'])->toBe('text');
+});
+
+// ──────────────────────────────────────────────
+// getWithMetadata (bulk get + withMetadata)
+// ──────────────────────────────────────────────
+
+it('reads a value with its expiration and metadata via bulk get', function (): void {
+    $history = [];
+    $client = makeClient([
+        new Response(200, [], json_encode([
+            'success' => true,
+            'result' => ['values' => [
+                'my:key' => ['value' => '{"n":1}', 'expiration' => 9999999, 'metadata' => ['x' => 'y']],
+            ]],
+        ], JSON_THROW_ON_ERROR)),
+    ], $history);
+
+    $entry = $client->getWithMetadata('my:key');
+
+    expect($entry)->toBe(['value' => '{"n":1}', 'expiration' => 9999999, 'metadata' => ['x' => 'y']])
+        ->and($history[0]['request']->getMethod())->toBe('POST')
+        ->and((string) $history[0]['request']->getUri())->toContain('/bulk/get');
+
+    $body = json_decode((string) $history[0]['request']->getBody(), true);
+    expect($body['keys'])->toBe(['my:key'])
+        ->and($body['type'])->toBe('text')
+        ->and($body['withMetadata'])->toBeTrue();
+});
+
+it('returns null from getWithMetadata for a missing key', function (): void {
+    $client = makeClient([
+        new Response(200, [], json_encode([
+            'success' => true,
+            'result' => ['values' => []],
+        ], JSON_THROW_ON_ERROR)),
+    ]);
+
+    expect($client->getWithMetadata('missing'))->toBeNull();
+});
+
+it('returns a null expiration from getWithMetadata when the key never expires', function (): void {
+    $client = makeClient([
+        new Response(200, [], json_encode([
+            'success' => true,
+            'result' => ['values' => [
+                'my:key' => ['value' => 'v', 'metadata' => null],
+            ]],
+        ], JSON_THROW_ON_ERROR)),
+    ]);
+
+    expect($client->getWithMetadata('my:key'))->toBe([
+        'value' => 'v',
+        'expiration' => null,
+        'metadata' => [],
+    ]);
 });
 
 // ──────────────────────────────────────────────
@@ -162,31 +257,6 @@ it('deletes multiple keys via the bulk delete endpoint', function (): void {
 });
 
 // ──────────────────────────────────────────────
-// Metadata
-// ──────────────────────────────────────────────
-
-it('reads metadata from the metadata endpoint', function (): void {
-    $history = [];
-    $client = makeClient([
-        new Response(200, [], json_encode([
-            'success' => true,
-            'result' => ['e' => 9999999],
-        ], JSON_THROW_ON_ERROR)),
-    ], $history);
-
-    $meta = $client->getMetadata('my:key');
-
-    expect($meta)->toBe(['e' => 9999999])
-        ->and((string) $history[0]['request']->getUri())->toContain('/metadata/my%3Akey');
-});
-
-it('returns null from getMetadata for a missing key', function (): void {
-    $client = makeClient([new Response(404, [], '{"success":false}')]);
-
-    expect($client->getMetadata('missing'))->toBeNull();
-});
-
-// ──────────────────────────────────────────────
 // Key listing (cursor pagination)
 // ──────────────────────────────────────────────
 
@@ -206,4 +276,18 @@ it('lists keys across Cloudflare cursor pages', function (): void {
     expect($client->keys('app:'))->toBe(['app:one', 'app:two'])
         ->and((string) $history[0]['request']->getUri())->toContain('prefix=app%3A')
         ->and((string) $history[1]['request']->getUri())->toContain('cursor=next-page');
+});
+
+it('lists a single bounded page without paginating', function (): void {
+    $history = [];
+    $client = makeClient([
+        new Response(200, [], json_encode([
+            'result' => [['name' => 'app:one']],
+            'result_info' => ['cursor' => 'more-pages'],
+        ], JSON_THROW_ON_ERROR)),
+    ], $history);
+
+    expect($client->keys('app:', 10))->toBe(['app:one'])
+        ->and($history)->toHaveCount(1)
+        ->and((string) $history[0]['request']->getUri())->toContain('limit=10');
 });

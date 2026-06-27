@@ -6,6 +6,8 @@ namespace Ziming\LaravelCloudflareWorkersKv;
 
 use Illuminate\Contracts\Cache\Store;
 use InvalidArgumentException;
+use Throwable;
+use Ziming\LaravelCloudflareWorkersKv\Serialization\PhpSerializer;
 use Ziming\LaravelCloudflareWorkersKv\Serialization\Serializer;
 
 /**
@@ -22,25 +24,24 @@ use Ziming\LaravelCloudflareWorkersKv\Serialization\Serializer;
  */
 final class CloudflareKvStore implements Store
 {
-    /**
-     * Metadata key used to track a key's absolute expiry so increment() can
-     * preserve the remaining TTL across the non-atomic read-modify-write.
-     */
-    private const string META_EXPIRES_AT = 'e';
-
     public function __construct(
         private readonly CloudflareKvClient $client,
         private readonly Serializer $serializer,
         private readonly string $prefix = '',
+        private readonly bool $graceful = false,
     ) {}
 
     public function get($key): mixed
     {
         $this->validateKey($key);
 
-        $value = $this->client->get($this->prefix.$key);
+        try {
+            $value = $this->client->get($this->prefix.$key);
+        } catch (CloudflareKvException $exception) {
+            return $this->onReadFailure($exception);
+        }
 
-        return $value === null ? null : $this->serializer->unserialize($value);
+        return $this->deserialize($value);
     }
 
     public function many(array $keys): array
@@ -58,13 +59,19 @@ final class CloudflareKvStore implements Store
             $keys,
         );
 
-        $raw = $this->client->many(array_keys($prefixed));
-
         $results = array_fill_keys($keys, null);
+
+        try {
+            $raw = $this->client->many(array_keys($prefixed));
+        } catch (CloudflareKvException $exception) {
+            $this->onReadFailure($exception);
+
+            return $results;
+        }
 
         foreach ($raw as $prefixedKey => $value) {
             if (isset($prefixed[$prefixedKey])) {
-                $results[$prefixed[$prefixedKey]] = $this->serializer->unserialize($value);
+                $results[$prefixed[$prefixedKey]] = $this->deserialize($value);
             }
         }
 
@@ -79,14 +86,10 @@ final class CloudflareKvStore implements Store
             return $this->forget($key);
         }
 
-        $ttl = (int) $seconds;
-        $metadata = [self::META_EXPIRES_AT => time() + $ttl];
-
         return $this->client->put(
             $this->prefix.$key,
             $this->serializer->serialize($value),
-            $ttl,
-            $metadata,
+            (int) $seconds,
         );
     }
 
@@ -102,20 +105,16 @@ final class CloudflareKvStore implements Store
         }
 
         $ttl = (int) $seconds;
-        $expiresAt = time() + $ttl;
-        $serializer = $this->serializer;
-        $useBase64 = $serializer instanceof Serialization\PhpSerializer;
+        $useBase64 = $this->serializer instanceof PhpSerializer;
 
         $entries = [];
         foreach ($values as $key => $value) {
             $this->validateKey((string) $key);
-            $serialized = $serializer->serialize($value);
             $entries[] = [
                 'key' => $this->prefix.$key,
-                'value' => $serialized,
+                'value' => $this->serializer->serialize($value),
                 'seconds' => $ttl,
                 'base64' => $useBase64,
-                'metadata' => [self::META_EXPIRES_AT => $expiresAt],
             ];
         }
 
@@ -127,40 +126,42 @@ final class CloudflareKvStore implements Store
      *
      * Note: KV does not support atomic increment. This performs a non-atomic
      * read-modify-write. Under concurrent writes, updates may be lost.
-     * The remaining TTL is approximated from metadata written at the last put().
+     *
+     * The key's exact expiry is preserved: the value and its absolute expiration
+     * are read in one call, then re-written with that same absolute expiration
+     * (or forever when the key has none), so a hot counter does not have its
+     * lifetime extended on every increment.
      */
     public function increment($key, $value = 1): int|bool
     {
         $this->validateKey($key);
 
-        $current = $this->get($key);
+        $entry = $this->client->getWithMetadata($this->prefix.$key);
+
+        if ($entry === null) {
+            return false;
+        }
+
+        $current = $this->deserialize($entry['value']);
 
         if (! is_numeric($current)) {
             return false;
         }
 
-        $newValue = (int) $current + (int) $value;
+        $expiration = $entry['expiration'];
 
-        $metadata = $this->client->getMetadata($this->prefix.$key);
-        $expiresAt = is_array($metadata) && is_int($metadata[self::META_EXPIRES_AT] ?? null)
-            ? $metadata[self::META_EXPIRES_AT]
-            : null;
-
-        if ($expiresAt !== null) {
-            $remaining = $expiresAt - time();
-            if ($remaining <= 0) {
-                return false;
-            }
-
-            return $this->client->put(
-                $this->prefix.$key,
-                $this->serializer->serialize($newValue),
-                $remaining,
-                [self::META_EXPIRES_AT => $expiresAt],
-            ) ? $newValue : false;
+        if ($expiration !== null && $expiration <= time()) {
+            return false;
         }
 
-        return $this->forever($key, $newValue) ? $newValue : false;
+        $newValue = (int) $current + (int) $value;
+
+        return $this->client->put(
+            $this->prefix.$key,
+            $this->serializer->serialize($newValue),
+            null,
+            $expiration,
+        ) ? $newValue : false;
     }
 
     public function decrement($key, $value = 1): int|bool
@@ -209,6 +210,50 @@ final class CloudflareKvStore implements Store
     public function getPrefix(): string
     {
         return $this->prefix;
+    }
+
+    /**
+     * The underlying key/value client. Exposed for operator tooling (artisan
+     * commands) so they target the same namespace this store is configured for.
+     */
+    public function client(): CloudflareKvClient
+    {
+        return $this->client;
+    }
+
+    public function serializer(): Serializer
+    {
+        return $this->serializer;
+    }
+
+    /**
+     * Deserialize a stored value, treating any failure (corrupt or foreign data)
+     * as a cache miss rather than letting it bubble out of get()/many().
+     */
+    private function deserialize(?string $value): mixed
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        try {
+            return $this->serializer->unserialize($value);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * When 'graceful' is enabled a read failure (KV outage) degrades to a cache
+     * miss instead of throwing. Default behaviour re-throws so failures are loud.
+     */
+    private function onReadFailure(CloudflareKvException $exception): mixed
+    {
+        if ($this->graceful) {
+            return null;
+        }
+
+        throw $exception;
     }
 
     /**

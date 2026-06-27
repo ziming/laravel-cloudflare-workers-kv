@@ -33,6 +33,14 @@ return [
 
     'base_url' => env('CLOUDFLARE_KV_BASE_URL', 'https://api.cloudflare.com/client/v4'),
 
+    // HTTP timeouts (seconds) so a hung connection never blocks the request.
+    'timeout' => env('CLOUDFLARE_KV_TIMEOUT', 5),
+    'connect_timeout' => env('CLOUDFLARE_KV_CONNECT_TIMEOUT', 2),
+
+    // When true, read failures (KV outage) degrade to a cache miss instead of
+    // throwing. See "Graceful reads" below.
+    'graceful' => env('CLOUDFLARE_KV_GRACEFUL', false),
+
     'serializer' => env('CLOUDFLARE_KV_SERIALIZER', 'php'),
 
     // Restricts which classes may be instantiated when unserializing PHP-serialized
@@ -111,6 +119,64 @@ From a Worker, read it as ordinary JSON:
 const flags = await env.KV.get("shared:feature-flags", "json");
 ```
 
+### Multiple namespaces
+
+Every value in `config/cloudflare-workers-kv.php` is a default that any cache store may
+override in `config/cache.php`, so a single app can target several KV namespaces:
+
+```php
+'stores' => [
+    'cloudflare' => [
+        'driver' => 'cloudflare-kv',
+    ],
+
+    'cloudflare-sessions' => [
+        'driver'       => 'cloudflare-kv',
+        'namespace_id' => env('CLOUDFLARE_KV_SESSIONS_NAMESPACE_ID'),
+        'prefix'       => 'sess:',
+    ],
+],
+```
+
+A store may override `account_id`, `namespace_id`, `api_token`, `base_url`, `timeout`,
+`connect_timeout`, `serializer`, `allowed_classes`, `prefix`, and `graceful`. Overriding any
+of the first six gives that store its own HTTP client; otherwise it shares the global one.
+Omitted keys fall back to the global config, so existing single-store setups keep working.
+
+### Graceful reads
+
+By default a KV outage (5xx / connection error) surfaces as a `CloudflareKvException` from
+reads. Set `'graceful' => true` (globally or per store) to make reads fail open — a failed
+`get()`/`many()` returns a cache miss (`null`) instead of throwing:
+
+```php
+'cloudflare' => [
+    'driver'   => 'cloudflare-kv',
+    'graceful' => true,
+],
+```
+
+This trades loud failures for availability. Note that failing open can let a KV outage
+unleash a thundering herd onto whatever the cache is protecting, so weigh it per workload.
+
+### Artisan commands
+
+Laravel's built-in `cache:clear --store=…` and `cache:forget … --store=…` work as usual. This
+package adds a few KV-specific helpers (all accept `--store=` and fall back to the global
+config when it is omitted):
+
+```bash
+# Validate credentials + connectivity and print the resolved configuration.
+php artisan cloudflare-kv:verify --store=cloudflare
+
+# List keys (optionally filtered) for debugging.
+php artisan cloudflare-kv:keys --store=cloudflare --prefix=user:
+
+# Fetch a single value (deserialized, or --raw for the stored bytes).
+php artisan cloudflare-kv:get user:1 --store=cloudflare
+php artisan cloudflare-kv:get user:1 --store=cloudflare --raw
+```
+
 ### Direct client
 
 You can also resolve the package client directly:
@@ -120,9 +186,14 @@ use Ziming\LaravelCloudflareWorkersKv\LaravelCloudflareWorkersKv;
 
 $kv = app(LaravelCloudflareWorkersKv::class);
 
-$kv->put('settings', ['theme' => 'dark']);
+$kv->put('settings', ['theme' => 'dark'], 3600); // optional TTL in seconds
+$kv->forever('settings', ['theme' => 'dark']);    // no expiry
 
 $settings = $kv->get('settings');
+
+// Read a value alongside its absolute expiry (unix timestamp, null if none):
+$entry = $kv->getWithMetadata('settings'); // ['value' => ..., 'expiration' => ..., 'metadata' => [...]]
+$expiresAt = $kv->expiresAt('settings');   // ?int
 ```
 
 The client also exposes bulk helpers, which use Cloudflare's bulk REST endpoints
@@ -140,6 +211,13 @@ $kv->deleteMany(['a', 'b']);                  // POST .../bulk/delete (up to 10,
 The same bulk endpoints back `Cache::many()`, `Cache::putMany()`, and `Cache::flush()`
 on the cache store, so flushing or warming many keys does not fan out into N HTTP calls.
 
+> **Binary values and `many()`.** Cloudflare's bulk-get endpoint returns values as text/JSON
+> and cannot carry non-UTF-8 bytes, so a binary value (e.g. a `php`-serialized payload that
+> contains raw binary strings) is silently dropped from a `many()` result even though the key
+> exists. PHP `serialize()` of typical scalars/arrays is ASCII and unaffected, but if you store
+> binary blobs use the `json` serializer or read them one at a time with `get()`, which streams
+> the raw body and is binary-safe.
+
 ## Caveats & consistency model
 
 Cloudflare Workers KV is an **eventually consistent, globally distributed** store. Its
@@ -150,10 +228,11 @@ it as your cache backend:
   for a short period while the change propagates globally. KV is optimized for read-heavy
   workloads, not read-after-write consistency.
 - **No atomic operations.** `increment()` / `decrement()` are implemented as a non-atomic
-  read-modify-write. Concurrent writers can lose updates. The remaining TTL is preserved by
-  reading expiry metadata written on the previous `put()`, but the counter value itself is
-  best-effort. **Do not use this store for rate limiting** (`RateLimiter`) where exact counts
-  matter under concurrency.
+  read-modify-write. Concurrent writers can lose updates. The key's exact expiry is preserved:
+  the value and its native absolute expiration are read together, then re-written with that
+  same expiration, so a hot counter is not kept alive forever — but the counter value itself
+  is best-effort. **Do not use this store for rate limiting** (`RateLimiter`) where exact
+  counts matter under concurrency.
 - **No cache locks.** The store does not implement `LockProvider`, so `Cache::lock()` is not
   available — KV cannot provide the atomic guarantees a lock requires. Use the `database` or
   `redis` store for locks.

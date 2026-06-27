@@ -11,24 +11,28 @@ final class InMemoryCloudflareKvClient implements CloudflareKvClient
     /** @var array<string, string> */
     public array $values = [];
 
-    /** @var array<string, int|null> */
-    public array $expirations = [];
+    /** @var array<string, int|null> Last TTL (seconds) passed to put(), or null for forever. */
+    public array $ttls = [];
 
-    /** @var array<string, array<string, mixed>> */
-    public array $metadata = [];
+    /** @var array<string, int|null> Resolved absolute expiry (unix ts), or null for forever. */
+    public array $expirations = [];
 
     public function get(string $key): ?string
     {
         return $this->values[$key] ?? null;
     }
 
-    public function getMetadata(string $key): ?array
+    public function getWithMetadata(string $key): ?array
     {
         if (! array_key_exists($key, $this->values)) {
             return null;
         }
 
-        return $this->metadata[$key] ?? [];
+        return [
+            'value' => $this->values[$key],
+            'expiration' => $this->expirations[$key] ?? null,
+            'metadata' => [],
+        ];
     }
 
     public function many(array $keys): array
@@ -44,11 +48,16 @@ final class InMemoryCloudflareKvClient implements CloudflareKvClient
         return $results;
     }
 
-    public function put(string $key, string $value, ?int $seconds = null, array $metadata = []): bool
+    public function put(string $key, string $value, ?int $ttl = null, ?int $expiration = null): bool
     {
         $this->values[$key] = $value;
-        $this->expirations[$key] = $seconds;
-        $this->metadata[$key] = $metadata;
+        $this->ttls[$key] = $ttl;
+
+        $this->expirations[$key] = match (true) {
+            $expiration !== null => $expiration,
+            $ttl !== null => time() + $ttl,
+            default => null,
+        };
 
         return true;
     }
@@ -56,8 +65,8 @@ final class InMemoryCloudflareKvClient implements CloudflareKvClient
     public function putMany(array $entries): bool
     {
         foreach ($entries as $entry) {
-            $value = ($entry['base64'] ?? false) ? base64_decode($entry['value'], true) ?: $entry['value'] : $entry['value'];
-            $this->put($entry['key'], $value, $entry['seconds'] ?? null, $entry['metadata'] ?? []);
+            $value = ($entry['base64'] ?? false) ? (base64_decode($entry['value'], true) ?: $entry['value']) : $entry['value'];
+            $this->put($entry['key'], $value, $entry['seconds'] ?? null);
         }
 
         return true;
@@ -65,7 +74,7 @@ final class InMemoryCloudflareKvClient implements CloudflareKvClient
 
     public function delete(string $key): bool
     {
-        unset($this->values[$key], $this->expirations[$key], $this->metadata[$key]);
+        unset($this->values[$key], $this->ttls[$key], $this->expirations[$key]);
 
         return true;
     }
@@ -79,11 +88,13 @@ final class InMemoryCloudflareKvClient implements CloudflareKvClient
         return true;
     }
 
-    public function keys(string $prefix = ''): array
+    public function keys(string $prefix = '', ?int $limit = null): array
     {
-        return array_values(array_filter(
+        $keys = array_values(array_filter(
             array_keys($this->values),
             fn (string $key): bool => str_starts_with($key, $prefix),
         ));
+
+        return $limit !== null ? array_slice($keys, 0, $limit) : $keys;
     }
 }

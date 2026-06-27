@@ -17,11 +17,26 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
 
     private const int BULK_WRITE_LIMIT = 10_000;
 
+    /**
+     * Cloudflare enforces a 60-second floor on key expiry (relative or absolute).
+     */
+    private const int MIN_TTL = 60;
+
     public function __construct(
         private ClientInterface $http,
         private string $accountId,
         private string $namespaceId,
     ) {}
+
+    public function accountId(): string
+    {
+        return $this->accountId;
+    }
+
+    public function namespaceId(): string
+    {
+        return $this->namespaceId;
+    }
 
     public function get(string $key): ?string
     {
@@ -42,29 +57,32 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
         return (string) $response->getBody();
     }
 
-    public function getMetadata(string $key): ?array
+    public function getWithMetadata(string $key): ?array
     {
-        try {
-            $response = $this->send('GET', $this->metadataUri($key));
-        } catch (ClientException $exception) {
-            if ($exception->getResponse()->getStatusCode() === 404) {
-                return null;
-            }
+        $body = json_encode([
+            'keys' => [$key],
+            'type' => 'text',
+            'withMetadata' => true,
+        ], JSON_THROW_ON_ERROR);
 
-            throw new CloudflareKvException(
-                $exception->getMessage(),
-                $exception->getCode(),
-                $exception,
-            );
-        }
-
+        $response = $this->send('POST', $this->namespaceUri().'/bulk/get', $body, ['Content-Type' => 'application/json']);
         $payload = json_decode((string) $response->getBody(), true);
 
-        if (! is_array($payload) || ! isset($payload['result'])) {
+        if (! is_array($payload) || ! isset($payload['result']['values']) || ! is_array($payload['result']['values'])) {
+            throw new CloudflareKvException('Cloudflare KV returned an invalid bulk get response.');
+        }
+
+        $entry = $payload['result']['values'][$key] ?? null;
+
+        if (! is_array($entry) || ! is_string($entry['value'] ?? null)) {
             return null;
         }
 
-        return is_array($payload['result']) ? $payload['result'] : null;
+        return [
+            'value' => $entry['value'],
+            'expiration' => is_int($entry['expiration'] ?? null) ? $entry['expiration'] : null,
+            'metadata' => is_array($entry['metadata'] ?? null) ? $entry['metadata'] : [],
+        ];
     }
 
     public function many(array $keys): array
@@ -76,7 +94,7 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
         $results = [];
 
         foreach (array_chunk($keys, self::BULK_GET_LIMIT) as $chunk) {
-            $body = json_encode(['keys' => $chunk], JSON_THROW_ON_ERROR);
+            $body = json_encode(['keys' => $chunk, 'type' => 'text'], JSON_THROW_ON_ERROR);
             $response = $this->send('POST', $this->namespaceUri().'/bulk/get', $body, ['Content-Type' => 'application/json']);
             $payload = json_decode((string) $response->getBody(), true);
 
@@ -94,21 +112,17 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
         return $results;
     }
 
-    public function put(string $key, string $value, ?int $seconds = null, array $metadata = []): bool
+    public function put(string $key, string $value, ?int $ttl = null, ?int $expiration = null): bool
     {
         $uri = $this->valueUri($key);
 
-        if ($seconds !== null) {
-            $uri .= '?expiration_ttl='.(string) max(60, $seconds);
+        if ($expiration !== null) {
+            $uri .= '?expiration='.(string) max($expiration, time() + self::MIN_TTL);
+        } elseif ($ttl !== null) {
+            $uri .= '?expiration_ttl='.(string) max(self::MIN_TTL, $ttl);
         }
 
-        $parts = [['name' => 'value', 'contents' => $value]];
-
-        if ($metadata !== []) {
-            $parts[] = ['name' => 'metadata', 'contents' => json_encode($metadata, JSON_THROW_ON_ERROR)];
-        }
-
-        $multipart = new MultipartStream($parts);
+        $multipart = new MultipartStream([['name' => 'value', 'contents' => $value]]);
         $response = $this->send(
             'PUT',
             $uri,
@@ -136,7 +150,7 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
                 ];
 
                 if (isset($entry['seconds'])) {
-                    $item['expiration_ttl'] = max(60, $entry['seconds']);
+                    $item['expiration_ttl'] = max(self::MIN_TTL, $entry['seconds']);
                 }
 
                 if (isset($entry['metadata']) && $entry['metadata'] !== []) {
@@ -201,7 +215,7 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
         return $success;
     }
 
-    public function keys(string $prefix = ''): array
+    public function keys(string $prefix = '', ?int $limit = null): array
     {
         $keys = [];
         $cursor = null;
@@ -210,6 +224,7 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
             $query = array_filter([
                 'prefix' => $prefix === '' ? null : $prefix,
                 'cursor' => $cursor,
+                'limit' => $limit,
             ]);
 
             $uri = $this->namespaceUri().'/keys'.($query === [] ? '' : '?'.http_build_query($query));
@@ -223,6 +238,11 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
                 if (is_array($key) && is_string($key['name'] ?? null)) {
                     $keys[] = $key['name'];
                 }
+            }
+
+            // A bounded request returns a single page only.
+            if ($limit !== null) {
+                break;
             }
 
             $resultInfo = $payload['result_info'] ?? [];
@@ -251,11 +271,6 @@ final readonly class RestCloudflareKvClient implements CloudflareKvClient
     private function valueUri(string $key): string
     {
         return $this->namespaceUri().'/values/'.rawurlencode($key);
-    }
-
-    private function metadataUri(string $key): string
-    {
-        return $this->namespaceUri().'/metadata/'.rawurlencode($key);
     }
 
     private function namespaceUri(): string
